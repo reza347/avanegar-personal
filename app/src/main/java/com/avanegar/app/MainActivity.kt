@@ -688,8 +688,8 @@ class MainActivity : Activity(), LiveSession.Listener {
                 if (ext !in setOf("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")) {
                     throw IOException("فرمت فایل پشتیبانی نمی‌شود")
                 }
-                temp = File.createTempFile("voice_", "." + ext, cacheDir)
-                val destination = temp
+                val destination = File.createTempFile("voice_", "." + ext, cacheDir)
+                temp = destination
                 contentResolver.openInputStream(uri)?.use { source ->
                     destination.outputStream().use { output ->
                         val buffer = ByteArray(16384)
