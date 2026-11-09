@@ -8,24 +8,24 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.text.InputType
-import android.util.Base64
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import okhttp3.Call
@@ -36,652 +36,719 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
-import kotlin.math.max
-import kotlin.math.min
 
 /**
- * آوانگار، نسخه ۰.۳.۱ - یک کادر متن + یک دکمه ضبط.
- * The user's API key is kept only in Android Keystore-encrypted local storage.
- * Realtime transcription uses the API's transcription session (no server VAD).
+ * آوانگار نسخه ۰.۴: ظاهر خلوت فارسی، رونویسی زنده، مکث/ادامه، ذخیره متن و WAV.
+ * بدون سرور واسطه؛ کلید فقط در Keystore دستگاه نگهداری می‌شود.
  */
-class MainActivity : Activity() {
+class MainActivity : Activity(), LiveSession.Listener {
     companion object {
-        private const val REQUEST_RECORD = 301
-        private const val REQUEST_FILE = 302
-        private const val REQUEST_EXPORT = 303
-        private const val SAMPLE_RATE = 24_000
-        private const val FRAME_BYTES = 4_800 // 100ms, mono PCM16
-        private const val COMMIT_EVERY_MS = 3_000 // periodic flush even for quiet speech
-        private const val HISTORY_KEY = "text_history"
-        private const val CURRENT_KEY = "current_text"
+        private const val PERMISSION_MIC = 401
+        private const val PICK_AUDIO = 402
+        private const val EXPORT_TEXT = 403
+        private const val DRAFT_KEY = "draft_text"
     }
+    private enum class Stage { IDLE, CONNECTING, RECORDING, PAUSED, SAVING }
+    private data class Piece(var partial: String = "", var completed: String = "", var edited: String? = null)
 
     private val ui = Handler(Looper.getMainLooper())
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS)
-        .build()
-    private val prefs by lazy { getSharedPreferences("avanegar_data", MODE_PRIVATE) }
+    private val prefs by lazy { getSharedPreferences("avanegar_prefs_v4", MODE_PRIVATE) }
     private val secrets by lazy { SecureApiKeyStore(this) }
+    private val archive by lazy { RecordingStore(this) }
+    private val http = OkHttpClient.Builder().connectTimeout(18, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS).build()
 
     private lateinit var status: TextView
     private lateinit var transcript: TextView
-    private lateinit var transcriptScroll: ScrollView
-    private lateinit var recordButton: Button
+    private lateinit var scroll: ScrollView
+    private lateinit var action: TextView
+    private lateinit var clock: TextView
+    private lateinit var glyph: ImageView
+    private lateinit var recordControl: LinearLayout
+    private lateinit var saveButton: ImageButton
 
-    private var socket: WebSocket? = null
-    private var mic: AudioRecord? = null
-    private var micThread: Thread? = null
-    private var connecting = false
-    @Volatile private var recording = false
-    private var stopping = false
-    private var uploading = false
-    private var micFinished = false
-    @Volatile private var generation = 0
-    private val pending = AtomicInteger(0)
-    private val paragraphs = StringBuilder()
-    private val partials = LinkedHashMap<String, String>()
-    private val finalizedIds = HashSet<String>()
-    private var recordingBase = ""
-    private var lastAutosave = 0L
+    private var stage = Stage.IDLE
+    private var live: LiveSession? = null
+    private var editor: PersianEditor? = null
+    private var rawAudio: File? = null
+    private val pieces = LinkedHashMap<String, Piece>()
+    private var baseText = ""
+    private var generation = 0
+    private var correctionsPending = 0
+    private var waitingSave = false
+    private var liveFinished = false
+    private var fileBusy = false
+    private var savedJustNow = false
+    private var player: MediaPlayer? = null
+    private var startedAt = 0L
+    private var accumulated = 0L
+    private var lastDraftSave = 0L
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.rgb(13, 16, 34)
-        window.navigationBarColor = Color.rgb(13, 16, 34)
+    override fun onCreate(state: Bundle?) {
+        super.onCreate(state)
+        window.statusBarColor = Color.rgb(21, 21, 23)
+        window.navigationBarColor = Color.rgb(21, 21, 23)
         setContentView(R.layout.activity_main)
         status = findViewById(R.id.status)
         transcript = findViewById(R.id.transcript)
-        transcriptScroll = findViewById(R.id.transcriptScroll)
-        recordButton = findViewById(R.id.recordButton)
-        transcript.text = prefs.getString(CURRENT_KEY, "").orEmpty()
-        transcript.setOnClickListener { copyText() }
+        scroll = findViewById(R.id.transcriptScroll)
+        action = findViewById(R.id.recordLabel)
+        clock = findViewById(R.id.timer)
+        glyph = findViewById(R.id.recordGlyph)
+        recordControl = findViewById(R.id.recordControl)
+        saveButton = findViewById(R.id.saveButton)
+        baseText = prefs.getString(DRAFT_KEY, "").orEmpty()
+
+        transcript.setOnClickListener { copyAll() }
         findViewById<ImageButton>(R.id.settingsButton).setOnClickListener { showSettings() }
-        recordButton.setOnClickListener {
-            if (recording || connecting) stopRecording() else startRecordingWithPermission()
-        }
-    }
+        findViewById<ImageButton>(R.id.deleteButton).setOnClickListener { confirmClear() }
+        saveButton.setOnClickListener { requestSave() }
+        recordControl.setOnClickListener { onRecordTapped() }
+        findViewById<TextView>(R.id.historyTab).setOnClickListener { showHistory() }
 
-    private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-    private fun busy() = recording || connecting || stopping || uploading
-    private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun currentText() = transcript.text.toString().trim()
-
-    private fun copyText() {
-        val all = currentText()
-        if (all.isBlank()) return toast("هنوز متنی برای کپی وجود ندارد")
-        (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(
-            ClipData.newPlainText("متن فارسی آوانگار", all)
-        )
-        toast("همه متن کپی شد ✓")
-    }
-
-    private fun persistText() = prefs.edit().putString(CURRENT_KEY, transcript.text.toString()).apply()
-
-    private fun renderLive() {
-        val combined = buildString {
-            append(recordingBase)
-            append(paragraphs)
-            for (part in partials.values) {
-                if (part.isNotBlank()) append(part)
+        render()
+        updateControls()
+        ui.post(object : Runnable {
+            override fun run() {
+                updateClock()
+                ui.postDelayed(this, 400)
             }
-        }.trimEnd()
-        transcript.text = combined
-        if (System.currentTimeMillis() - lastAutosave >= 1800) {
-            lastAutosave = System.currentTimeMillis()
-            persistText()
-        }
-        transcriptScroll.post { transcriptScroll.fullScroll(View.FOCUS_DOWN) }
+        })
     }
 
-    // A deliberately small settings menu. No secondary controls clutter the home screen.
+    private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
+    private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
+    private fun key(): String? = try { secrets.load() } catch (_: Exception) { null }
+    private fun persianDigits(value: String): String = buildString {
+        value.forEach { c ->
+            append(if (c in '0'..'9') ('۰'.code + c.code - '0'.code).toChar() else c)
+        }
+    }
+
+    private fun updateClock() {
+        val millis = accumulated +
+            (if (stage == Stage.RECORDING) SystemClock.elapsedRealtime() - startedAt else 0L)
+        val seconds = (millis / 1000).coerceAtLeast(0)
+        clock.text = persianDigits(String.format(Locale.US, "%d:%02d", seconds / 60, seconds % 60))
+    }
+
+    private fun stopClock() {
+        if (stage == Stage.RECORDING) {
+            accumulated += (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0)
+        }
+    }
+
+    private fun updateControls() {
+        val busy = stage == Stage.SAVING || fileBusy
+        when (stage) {
+            Stage.IDLE -> {
+                action.text = "شروع ضبط"
+                glyph.setImageResource(R.drawable.ic_mic)
+            }
+            Stage.CONNECTING -> {
+                action.text = "در حال اتصال"
+                glyph.setImageResource(R.drawable.ic_mic)
+            }
+            Stage.RECORDING -> {
+                action.text = "مکث"
+                glyph.setImageResource(R.drawable.ic_pause_round)
+            }
+            Stage.PAUSED -> {
+                action.text = "ادامه ضبط"
+                glyph.setImageResource(R.drawable.ic_play_round)
+            }
+            Stage.SAVING -> {
+                action.text = "در حال ذخیره"
+                glyph.setImageResource(R.drawable.ic_checkmark)
+            }
+        }
+        recordControl.alpha = if (busy) 0.55f else 1f
+        saveButton.alpha = if (busy) 0.55f else 1f
+        recordControl.isEnabled = !busy
+        saveButton.isEnabled = !busy
+        window.run {
+            if (stage == Stage.RECORDING || stage == Stage.CONNECTING || stage == Stage.SAVING) {
+                addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        updateClock()
+    }
+
+    private fun allText(): String = buildString {
+        if (baseText.isNotBlank()) append(baseText.trim())
+        for (part in pieces.values) {
+            val text = (part.edited ?: part.completed.ifBlank { part.partial }).trim()
+            if (text.isNotBlank()) {
+                if (isNotEmpty()) append("\n")
+                append(text)
+            }
+        }
+    }.trim()
+
+    private fun render() {
+        val full = allText()
+        transcript.text = if (full.isBlank()) "گفتار فارسی اینجا نوشته می‌شود…" else full
+        transcript.setTextColor(if (full.isBlank()) Color.rgb(143, 147, 157) else Color.rgb(244, 244, 246))
+        if (System.currentTimeMillis() - lastDraftSave > 1200) {
+            lastDraftSave = System.currentTimeMillis()
+            saveDraft()
+        }
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun saveDraft() = prefs.edit().putString(DRAFT_KEY, allText()).apply()
+
+    private fun copyAll() {
+        val text = allText()
+        if (text.isBlank()) return toast("متنی برای کپی وجود ندارد")
+        val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        manager.setPrimaryClip(ClipData.newPlainText("متن آوانگار", text))
+        toast("تمام متن کپی شد ✓")
+    }
+
+    private fun onRecordTapped() {
+        if (fileBusy) return toast("تبدیل فایل در حال انجام است")
+        when (stage) {
+            Stage.IDLE -> {
+                if (rawAudio?.exists() == true) {
+                    AlertDialog.Builder(this)
+                        .setMessage("صدای ضبط قبلی هنوز ذخیره نشده است. ضبط جدید جایگزین آن شود؟")
+                        .setNegativeButton("انصراف", null)
+                        .setPositiveButton("ضبط جدید") { _, _ ->
+                            rawAudio?.delete()
+                            rawAudio = null
+                            startWithPermission()
+                        }.show()
+                } else startWithPermission()
+            }
+            Stage.CONNECTING -> {
+                live?.cancel()
+                live = null
+                stage = Stage.IDLE
+                status.text = "اتصال لغو شد"
+                updateControls()
+            }
+            Stage.RECORDING -> {
+                stopClock()
+                stage = Stage.PAUSED
+                live?.pause()
+                status.text = "ضبط مکث شد؛ برای ادامه دکمه وسط را بزنید"
+                updateControls()
+            }
+            Stage.PAUSED -> {
+                stage = Stage.CONNECTING
+                status.text = "در حال ادامه ضبط…"
+                live?.resume()
+                updateControls()
+            }
+            Stage.SAVING -> Unit
+        }
+    }
+
+    private fun startWithPermission() {
+        if (key().isNullOrBlank()) return toast("ابتدا کلید OpenAI را در تنظیمات وارد کنید")
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), PERMISSION_MIC)
+        } else startLive()
+    }
+
+    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) {
+        super.onRequestPermissionsResult(code, permissions, grants)
+        if (code == PERMISSION_MIC) {
+            if (grants.firstOrNull() == PackageManager.PERMISSION_GRANTED) startLive()
+            else toast("اجازه دسترسی به میکروفون لازم است")
+        }
+    }
+
+    private fun startLive() {
+        val secret = key() ?: return
+        if (stage != Stage.IDLE) return
+        if (savedJustNow) {
+            baseText = ""
+            pieces.clear()
+            savedJustNow = false
+        } else baseText = allText()
+        pieces.clear()
+        accumulated = 0
+        startedAt = 0
+        generation++
+        correctionsPending = 0
+        waitingSave = false
+        liveFinished = false
+        editor = PersianEditor(secret)
+        stage = Stage.CONNECTING
+        status.text = "در حال اتصال به رونویسی زنده…"
+        render()
+        updateControls()
+        try {
+            live = LiveSession(this, secret, this).also { it.open() }
+        } catch (_: Exception) {
+            stage = Stage.IDLE
+            status.text = "ساخت فایل ضبط ممکن نشد؛ حافظه گوشی را بررسی کنید"
+            updateControls()
+        }
+    }
+
+    override fun onReady() {
+        if (stage == Stage.CONNECTING) status.text = "در حال راه‌اندازی میکروفون…"
+    }
+
+    override fun onMicrophoneStarted() {
+        if (stage != Stage.CONNECTING && stage != Stage.PAUSED) return
+        startedAt = SystemClock.elapsedRealtime()
+        stage = Stage.RECORDING
+        status.text = "● در حال شنیدن و نوشتن فارسی"
+        updateControls()
+    }
+
+    override fun onMicrophonePaused() {
+        if (stage == Stage.PAUSED) status.text = "مکث شد؛ برای ادامه دکمه وسط را بزنید"
+    }
+
+    override fun onCommitted(itemId: String) {
+        if (stage != Stage.IDLE) pieces.getOrPut(itemId) { Piece() }
+    }
+
+    override fun onDelta(itemId: String, value: String) {
+        if (stage == Stage.IDLE) return
+        val part = pieces.getOrPut(itemId) { Piece() }
+        if (part.completed.isBlank()) {
+            part.partial += value
+            render()
+        }
+    }
+
+    override fun onFinal(itemId: String, value: String) {
+        if (stage == Stage.IDLE) return
+        val part = pieces.getOrPut(itemId) { Piece() }
+        val normalized = editor?.normalize(value).orEmpty().ifBlank {
+            editor?.normalize(part.partial).orEmpty()
+        }
+        part.completed = normalized
+        part.partial = ""
+        render()
+        if (normalized.length > 5 && prefs.getBoolean("correction", true)) {
+            val revision = generation
+            correctionsPending++
+            editor?.correct(normalized) { corrected ->
+                if (revision != generation) return@correct
+                if (part.completed == normalized) part.edited = corrected
+                correctionsPending = (correctionsPending - 1).coerceAtLeast(0)
+                render()
+                maybeSave()
+            }
+        }
+        maybeSave()
+    }
+
+    override fun onProblem(text: String) {
+        status.text = text
+    }
+
+    override fun onFinished(pcmFile: File, problem: String?) {
+        rawAudio = pcmFile
+        live = null
+        liveFinished = true
+        if (waitingSave) {
+            status.text = "در حال تکمیل متن و اصلاح املا…"
+            maybeSave()
+        } else {
+            stopClock()
+            stage = Stage.IDLE
+            status.text = problem ?: "ضبط پایان یافت؛ تیک را برای ذخیره بزنید"
+            updateControls()
+            saveDraft()
+        }
+    }
+
+    private fun requestSave() {
+        if (stage == Stage.SAVING || fileBusy) return
+        if (allText().isBlank() && rawAudio == null && live == null) {
+            return toast("متن یا صدایی برای ذخیره وجود ندارد")
+        }
+        stopClock()
+        waitingSave = true
+        stage = Stage.SAVING
+        status.text = "در حال نهایی‌کردن ضبط و متن…"
+        updateControls()
+        if (live != null) {
+            liveFinished = false
+            live?.finish()
+        } else liveFinished = true
+        maybeSave()
+        val revision = generation
+        ui.postDelayed({
+            if (revision == generation && waitingSave && liveFinished) persistRecording()
+        }, 9000)
+    }
+
+    private fun maybeSave() {
+        if (waitingSave && liveFinished && correctionsPending == 0) persistRecording()
+    }
+
+    private fun persistRecording() {
+        if (!waitingSave || !liveFinished) return
+        waitingSave = false
+        generation++ // پاسخ اصلاح املایی دیررس دیگر متن ذخیره‌شده را تغییر نمی‌دهد.
+        val content = allText()
+        val pcm = rawAudio
+        rawAudio = null
+        status.text = "در حال ذخیره متن و صدا روی گوشی…"
+        Thread {
+            try {
+                archive.save(content, pcm)
+                ui.post {
+                    savedJustNow = true
+                    stage = Stage.IDLE
+                    status.text = "✓ متن و صدای ضبط‌شده ذخیره شدند"
+                    saveDraft()
+                    updateControls()
+                    toast("با موفقیت ذخیره شد ✓")
+                }
+            } catch (_: Exception) {
+                ui.post {
+                    rawAudio = pcm?.takeIf { it.exists() }
+                    stage = Stage.IDLE
+                    status.text = "ذخیره انجام نشد؛ فضای خالی گوشی را بررسی کنید"
+                    updateControls()
+                }
+            }
+        }.apply { name = "Avanegar-Save"; start() }
+    }
+
+    private fun confirmClear() {
+        if (fileBusy || stage == Stage.SAVING) return toast("ابتدا عملیات فعلی تمام شود")
+        AlertDialog.Builder(this)
+            .setTitle("حذف متن")
+            .setMessage("تمام نوشته‌های داخل کادر و ضبط ذخیره‌نشده پاک شوند؟ تاریخچه محفوظ می‌ماند.")
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("حذف") { _, _ ->
+                generation++
+                live?.cancel()
+                live = null
+                rawAudio?.delete()
+                rawAudio = null
+                baseText = ""
+                pieces.clear()
+                correctionsPending = 0
+                waitingSave = false
+                liveFinished = false
+                savedJustNow = false
+                stage = Stage.IDLE
+                accumulated = 0
+                render()
+                saveDraft()
+                updateControls()
+                status.text = "کادر پاک شد"
+            }.show()
+    }
+
+    private fun showHistory() {
+        if (stage != Stage.IDLE || fileBusy) return toast("ابتدا ضبط را تمام کنید")
+        val entries = archive.list()
+        if (entries.isEmpty()) return toast("هنوز متنی ذخیره نشده است")
+        AlertDialog.Builder(this).setTitle("تاریخچه ضبط‌ها")
+            .setItems(entries.map { archive.label(it) }.toTypedArray()) { _, index ->
+                val chosen = entries[index]
+                AlertDialog.Builder(this).setTitle("ضبط ذخیره‌شده")
+                    .setItems(arrayOf("بازکردن متن", "پخش فایل صوتی", "اشتراک متن", "حذف از تاریخچه")) { _, item ->
+                        when (item) {
+                            0 -> {
+                                baseText = chosen.text
+                                pieces.clear()
+                                rawAudio?.delete()
+                                rawAudio = null
+                                savedJustNow = false
+                                render()
+                                saveDraft()
+                                status.text = "متن بازیابی شد؛ با لمس کادر کپی می‌شود"
+                            }
+                            1 -> playAudio(chosen)
+                            2 -> shareText(chosen.text)
+                            3 -> AlertDialog.Builder(this)
+                                .setMessage("این ضبط و فایل صوتی آن از تاریخچه حذف شوند؟")
+                                .setNegativeButton("انصراف", null)
+                                .setPositiveButton("حذف") { _, _ ->
+                                    archive.delete(chosen)
+                                    toast("ضبط از تاریخچه حذف شد")
+                                }.show()
+                        }
+                    }.show()
+            }.setNegativeButton("بستن", null).show()
+    }
+
+    private fun playAudio(item: RecordingStore.Entry) {
+        val file = archive.audioOf(item)
+        if (file == null) return toast("برای این متن فایل صوتی ذخیره نشده است")
+        try {
+            player?.release()
+            player = MediaPlayer().apply {
+                setDataSource(file.absolutePath)
+                prepare()
+                setOnCompletionListener {
+                    it.release()
+                    if (player === it) player = null
+                }
+                start()
+            }
+            toast("در حال پخش فایل صوتی")
+        } catch (_: Exception) {
+            toast("پخش صدا ممکن نشد")
+        }
+    }
+
+    private fun shareText(value: String = allText()) {
+        if (value.isBlank()) return toast("متنی برای اشتراک وجود ندارد")
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, value)
+        }, "اشتراک متن فارسی"))
+    }
+
     private fun showSettings() {
-        val scroller = ScrollView(this)
-        val panel = LinearLayout(this).apply {
+        if (stage == Stage.SAVING) return toast("در حال ذخیره است")
+        val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(10), dp(20), dp(12))
+            setPadding(dp(17), dp(8), dp(17), dp(8))
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-        scroller.addView(panel)
-        val keyLabel = TextView(this).apply {
-            text = "کلید OpenAI API"
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            setPadding(0, dp(12), 0, dp(7))
+        val scroller = ScrollView(this)
+        scroller.addView(container)
+        val title = TextView(this).apply {
+            text = "کلید OpenAI"
+            textSize = 17f
+            setPadding(0, dp(6), 0, dp(8))
         }
-        panel.addView(keyLabel)
-        val keyInput = EditText(this).apply {
-            hint = "کلید را اینجا پیست کنید (sk-...)"
+        container.addView(title)
+        val input = EditText(this).apply {
+            hint = "کلید را پیست کنید (sk-…)"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             isSingleLine = true
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             textDirection = View.TEXT_DIRECTION_LTR
         }
-        panel.addView(keyInput)
-        val keyInfo = TextView(this).apply {
+        container.addView(input)
+        val info = TextView(this).apply {
+            text = if (key().isNullOrBlank()) "هنوز کلیدی ذخیره نشده" else "✓ کلید به‌صورت رمزگذاری‌شده ذخیره شده است"
             textSize = 13f
-            setTextColor(Color.rgb(190, 190, 215))
-            text = keyStatus()
-            setPadding(0, dp(6), 0, dp(8))
+            setPadding(0, dp(8), 0, dp(12))
         }
-        panel.addView(keyInfo)
-
-        fun button(title: String, action: () -> Unit) {
-            val btn = Button(this).apply {
-                text = title
+        container.addView(info)
+        fun button(label: String, callback: () -> Unit) {
+            container.addView(Button(this).apply {
+                text = label
                 isAllCaps = false
                 textSize = 14f
-                setOnClickListener { action() }
+                setOnClickListener { callback() }
+            }, LinearLayout.LayoutParams(-1, dp(49)))
+        }
+        fun saveEntered(): Boolean {
+            val candidate = input.text.toString().trim()
+            if (!candidate.startsWith("sk-") || candidate.length < 15) {
+                toast("کلید باید با sk- شروع شود")
+                return false
             }
-            panel.addView(btn, LinearLayout.LayoutParams(-1, dp(51)))
-        }
-        button("ذخیره کلید API") {
-            if (saveKey(keyInput.text.toString())) {
-                keyInput.text.clear()
-                keyInfo.text = keyStatus()
+            return try {
+                secrets.save(candidate)
+                input.text.clear()
+                info.text = "✓ کلید رمزگذاری و ذخیره شد"
+                toast("کلید ذخیره شد")
+                true
+            } catch (_: Exception) {
+                toast("کلید ذخیره نشد")
+                false
             }
         }
-        button("تست اتصال OpenAI") {
-            val entered = keyInput.text.toString().trim()
-            if (entered.isNotBlank()) {
-                if (!saveKey(entered)) return@button
-                keyInput.text.clear()
+        button("ذخیره کلید API") { saveEntered() }
+        button("آزمایش اتصال") {
+            if (input.text.isNotBlank() && !saveEntered()) return@button
+            val secret = key()
+            if (secret.isNullOrBlank()) toast("ابتدا کلید را ذخیره کنید")
+            else {
+                info.text = "در حال آزمایش اتصال…"
+                testConnection(secret, info)
             }
-            val key = savedKey() ?: return@button
-            keyInfo.text = "در حال آزمایش کلید…"
-            testConnection(key, keyInfo)
         }
-        button("حذف کلید API") {
-            AlertDialog.Builder(this).setMessage("کلید ذخیره‌شده از این گوشی حذف شود؟")
-                .setNegativeButton("انصراف", null)
-                .setPositiveButton("حذف") { _, _ ->
-                    secrets.clear()
-                    keyInput.text.clear()
-                    keyInfo.text = keyStatus()
-                    toast("کلید حذف شد")
-                }.show()
+        val correction = Switch(this).apply {
+            text = "اصلاح خودکار املا و نشانه‌گذاری"
+            isChecked = prefs.getBoolean("correction", true)
+            textSize = 14f
+            setPadding(0, dp(12), 0, dp(12))
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean("correction", checked).apply()
+            }
         }
-
-        panel.addView(TextView(this).apply {
-            text = "ابزارهای متن"
-            textSize = 18f
-            setTextColor(Color.WHITE)
-            setPadding(0, dp(20), 0, dp(6))
+        container.addView(correction)
+        container.addView(TextView(this).apply {
+            text = "اصلاح متن در پس‌زمینه انجام می‌شود تا نمایش گفتار کند نشود. این قابلیت مصرف جداگانه اعتبار OpenAI دارد."
+            textSize = 12f
+            setPadding(0, 0, 0, dp(12))
         })
-        // Secondary tasks live exclusively behind the gear icon.
         lateinit var dialog: AlertDialog
-        button("انتخاب و تبدیل فایل صوتی") {
-            if (busy()) return@button toast("ابتدا عملیات فعلی را تمام کنید")
-            if (savedKey() == null) return@button
+        button("تبدیل فایل صوتی به متن") {
+            if (stage != Stage.IDLE || fileBusy) return@button toast("ابتدا ضبط را تمام کنید")
+            if (key().isNullOrBlank()) return@button toast("اول کلید OpenAI را ذخیره کنید")
             dialog.dismiss()
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "audio/*"
-            }, REQUEST_FILE)
+            }, PICK_AUDIO)
         }
-        button("ذخیره متن در تاریخچه") { saveHistory() }
-        button("نمایش تاریخچه") { dialog.dismiss(); showHistory() }
-        button("اشتراک‌گذاری متن") { shareText() }
-        button("خروجی فایل TXT") {
-            if (currentText().isBlank()) return@button toast("متنی برای خروجی نیست")
+        button("تاریخچه ضبط‌ها") { dialog.dismiss(); showHistory() }
+        button("اشتراک متن داخل کادر") { shareText() }
+        button("ذخیره متن به فایل TXT") {
+            if (allText().isBlank()) return@button toast("هنوز متنی وجود ندارد")
             dialog.dismiss()
             startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "text/plain"
-                putExtra(Intent.EXTRA_TITLE, "avanegar-${System.currentTimeMillis()}.txt")
-            }, REQUEST_EXPORT)
+                putExtra(Intent.EXTRA_TITLE, "avanegar-" + System.currentTimeMillis() + ".txt")
+            }, EXPORT_TEXT)
         }
-        button("پاک‌کردن متن و شروع جدید") {
-            if (busy()) return@button toast("ابتدا ضبط را متوقف کنید")
-            AlertDialog.Builder(this).setMessage("متن داخل کادر پاک شود؟")
+        button("حذف کلید ذخیره‌شده") {
+            AlertDialog.Builder(this)
+                .setMessage("کلید API از حافظه امن این گوشی پاک شود؟")
                 .setNegativeButton("انصراف", null)
-                .setPositiveButton("پاک کن") { _, _ ->
-                    transcript.text = ""
-                    persistText()
-                    status.text = "برای شروع، دکمه ضبط را بزنید"
-                    toast("متن پاک شد")
-                    dialog.dismiss()
+                .setPositiveButton("حذف") { _, _ ->
+                    secrets.clear()
+                    info.text = "کلید حذف شد"
+                    toast("کلید پاک شد")
                 }.show()
         }
-        panel.addView(TextView(this).apply {
-            text = "فقط فارسی · اتصال مستقیم به OpenAI · برای استفاده شخصی\nکلید در حافظه رمزنگاری‌شده گوشی نگهداری می‌شود."
+        container.addView(TextView(this).apply {
+            text = "فقط فارسی • مخصوص استفاده شخصی\nهیچ کلیدی در GitHub ذخیره نمی‌شود."
             gravity = Gravity.CENTER
             textSize = 12f
-            setPadding(0, dp(16), 0, 0)
+            setPadding(0, dp(15), 0, dp(9))
         })
-        dialog = AlertDialog.Builder(this)
-            .setTitle("تنظیمات آوانگار ⚙")
-            .setView(scroller)
-            .setNegativeButton("بستن", null)
-            .create()
+        dialog = AlertDialog.Builder(this).setTitle("تنظیمات آوانگار")
+            .setView(scroller).setNegativeButton("بستن", null).create()
         dialog.show()
     }
 
-    private fun keyStatus(): String = try {
-        if (secrets.load().isNullOrBlank()) "کلیدی ذخیره نشده است" else "✓ کلید به‌صورت رمزگذاری‌شده ذخیره شده است"
-    } catch (_: Exception) { "کلید ذخیره‌شده قابل خواندن نیست؛ آن را حذف و دوباره وارد کنید" }
-
-    private fun saveKey(input: String): Boolean {
-        val key = input.trim()
-        if (!key.startsWith("sk-") || key.length < 15) {
-            toast("کلید معتبر نیست؛ باید با sk- شروع شود")
-            return false
-        }
-        return try {
-            secrets.save(key)
-            toast("کلید ذخیره شد ✓")
-            true
-        } catch (_: Exception) {
-            toast("ذخیره کلید ممکن نشد")
-            false
-        }
-    }
-
-    private fun savedKey(): String? {
-        val key = try { secrets.load() } catch (_: Exception) { null }
-        if (key.isNullOrBlank()) {
-            toast("ابتدا کلید OpenAI را از تنظیمات ذخیره کنید")
-            return null
-        }
-        return key
-    }
-
-    private fun testConnection(key: String, label: TextView) {
-        val request = Request.Builder()
-            .url("https://api.openai.com/v1/models/gpt-live-transcribe")
-            .header("Authorization", "Bearer $key")
-            .get().build()
-        http.newCall(request).enqueue(object : Callback {
+    private fun testConnection(secret: String, result: TextView) {
+        val req = Request.Builder().url("https://api.openai.com/v1/models/gpt-live-transcribe")
+            .header("Authorization", "Bearer " + secret).get().build()
+        http.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                ui.post { label.text = "خطای شبکه: ${e.localizedMessage.orEmpty()}" }
+                ui.post { result.text = "اتصال اینترنت برقرار نشد" }
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    val error = if (it.isSuccessful) "" else apiError(it.body?.string().orEmpty(), it.code)
                     ui.post {
-                        label.text = if (error.isEmpty()) {
-                            "✓ کلید به مدل رونویسی دسترسی دارد (اعتبار مصرفی هنگام ضبط بررسی می‌شود)"
-                        } else "خطا: $error"
+                        result.text = when (it.code) {
+                            200 -> "✓ کلید شناسایی شد؛ دسترسی ضبط هنگام شروع بررسی می‌شود"
+                            401 -> "کلید نامعتبر است"
+                            403 -> "حساب به این مدل دسترسی ندارد"
+                            429 -> "محدودیت درخواست یا اعتبار فعال است"
+                            else -> "ارتباط برقرار نشد (کد " + persianDigits(it.code.toString()) + ")"
+                        }
                     }
                 }
             }
         })
     }
 
-    private fun startRecordingWithPermission() {
-        if (busy() || savedKey() == null) return
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_RECORD)
-        } else connectLive()
-    }
-
-    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) {
-        super.onRequestPermissionsResult(code, permissions, grants)
-        if (code == REQUEST_RECORD) {
-            if (grants.firstOrNull() == PackageManager.PERMISSION_GRANTED) connectLive()
-            else toast("برای ضبط اجازه دسترسی به میکروفون لازم است")
-        }
-    }
-
-    private fun connectLive() {
-        if (busy()) return
-        val key = savedKey() ?: return
-        connecting = true
-        stopping = false
-        micFinished = false
-        pending.set(0)
-        paragraphs.clear()
-        partials.clear()
-        finalizedIds.clear()
-        recordingBase = currentText().let { if (it.isNotBlank()) "$it\n" else "" }
-        status.text = "در حال اتصال به OpenAI…"
-        recordButton.text = "لغو اتصال"
-        val id = ++generation
-        // GA transcription endpoint: no ?model= parameter, no server-side VAD.
-        val request = Request.Builder()
-            .url("wss://api.openai.com/v1/realtime?intent=transcription")
-            .header("Authorization", "Bearer $key")
-            .build()
-        socket = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                val input = JSONObject()
-                    .put("format", JSONObject().put("type", "audio/pcm").put("rate", SAMPLE_RATE))
-                    .put("transcription", JSONObject()
-                        .put("model", "gpt-live-transcribe")
-                        .put("languages", JSONArray().put("fa"))
-                        .put("delay", "low")
-                        .put("prompt", "گفتار فارسی؛ پاسخ را با خط فارسی بنویس."))
-                    .put("turn_detection", JSONObject.NULL)
-                val update = JSONObject().put("type", "session.update")
-                    .put("session", JSONObject().put("type", "transcription")
-                        .put("audio", JSONObject().put("input", input)))
-                webSocket.send(update.toString())
-            }
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                val event = try { JSONObject(text) } catch (_: Exception) { return }
-                ui.post { if (id == generation) onLiveEvent(event, id) }
-            }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val description = try {
-                    response?.body?.string()?.let { apiError(it, response.code) }
-                } catch (_: Exception) { null }
-                val reason = description ?: t.localizedMessage ?: "اتصال اینترنت قطع شد"
-                ui.post { if (id == generation) endSession("اتصال قطع شد: $reason") }
-            }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                ui.post { if (id == generation) endSession("اتصال بسته شد ($code)") }
-            }
-        })
-    }
-
-    private fun onLiveEvent(event: JSONObject, id: Int) {
-        when (event.optString("type")) {
-            "session.updated" -> {
-                if (connecting) {
-                    connecting = false
-                    beginMicrophone(id)
-                }
-            }
-            "conversation.item.input_audio_transcription.delta" -> {
-                val itemId = event.optString("item_id", "unknown")
-                if (!finalizedIds.contains(itemId)) {
-                    partials[itemId] = partials.getOrDefault(itemId, "") + event.optString("delta")
-                    renderLive()
-                }
-            }
-            "conversation.item.input_audio_transcription.completed" -> {
-                val itemId = event.optString("item_id", "unknown")
-                if (finalizedIds.add(itemId)) {
-                    val text = event.optString("transcript", partials[itemId].orEmpty()).trim()
-                    partials.remove(itemId)
-                    if (text.isNotBlank()) paragraphs.append(text).append('\n')
-                    renderLive()
-                    pending.updateAndGet { max(0, it - 1) }
-                }
-                finishIfComplete()
-            }
-            "conversation.item.input_audio_transcription.failed" -> {
-                partials.remove(event.optString("item_id"))
-                pending.updateAndGet { max(0, it - 1) }
-                status.text = "یک بخش از گفتار قابل تشخیص نبود"
-                renderLive()
-                finishIfComplete()
-            }
-            "error" -> {
-                val message = event.optJSONObject("error")?.optString("message")
-                    ?: "خطای نامشخص"
-                endSession("خطای OpenAI: $message")
-            }
-        }
-    }
-
-    private fun beginMicrophone(id: Int) {
-        val minSize = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
-        )
-        if (minSize <= 0) return endSession("میکروفون از نمونه‌برداری ۲۴ کیلوهرتز پشتیبانی نمی‌کند")
-        val device = try {
-            AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                max(minSize, FRAME_BYTES * 4))
-        } catch (_: Exception) {
-            return endSession("امکان دسترسی به میکروفون وجود ندارد")
-        }
-        if (device.state != AudioRecord.STATE_INITIALIZED) {
-            device.release()
-            return endSession("میکروفون قابل استفاده نیست")
-        }
-        try { device.startRecording() } catch (_: Exception) {
-            device.release()
-            return endSession("ضبط شروع نشد؛ مجوز میکروفون را بررسی کنید")
-        }
-        mic = device
-        recording = true
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        recordButton.text = "■  توقف ضبط"
-        status.text = "● در حال شنیدن و نوشتن فارسی…"
-
-        micThread = Thread {
-            val chunk = ByteArray(FRAME_BYTES)
-            var segmentMs = 0
-            try {
-                while (recording && id == generation) {
-                    val count = device.read(chunk, 0, chunk.size)
-                    if (count < 0) throw IOException("خطای میکروفون ($count)")
-                    if (count == 0) continue
-                    val audio = Base64.encodeToString(chunk, 0, count, Base64.NO_WRAP)
-                    if (socket?.send(JSONObject().put("type", "input_audio_buffer.append")
-                            .put("audio", audio).toString()) != true) {
-                        throw IOException("اتصال انتقال صدا برقرار نیست")
-                    }
-                    if ((socket?.queueSize() ?: 0) > 3_000_000) throw IOException("اینترنت برای ارسال صدا کند است")
-                    segmentMs += count * 1000 / (SAMPLE_RATE * 2)
-                    // Do not require a high microphone volume threshold. The prior version
-                    // could record silently forever without committing any audio segment.
-                    if (segmentMs >= COMMIT_EVERY_MS) {
-                        commitAudio()
-                        segmentMs = 0
-                    }
-                }
-                if (id == generation && segmentMs >= 300) commitAudio()
-            } catch (e: Exception) {
-                ui.post { if (id == generation) endSession("ضبط قطع شد: ${e.localizedMessage.orEmpty()}") }
-            } finally {
-                try { device.stop() } catch (_: Exception) { }
-                device.release()
-                ui.post {
-                    if (mic === device) mic = null
-                    if (id == generation) {
-                        micFinished = true
-                        finishIfComplete()
-                        ui.postDelayed({
-                            if (id == generation && stopping) {
-                                endSession("پایان ضبط (مهلت دریافت پاسخ تمام شد)")
-                            }
-                        }, 18_000)
-                    }
-                }
-            }
-        }.apply { name = "Avanegar-Live-Audio"; start() }
-    }
-
-    private fun commitAudio() {
-        // Called from the microphone thread, FIFO in the same OkHttp WebSocket queue.
-        if (socket?.send("{\"type\":\"input_audio_buffer.commit\"}") == true) {
-            pending.incrementAndGet()
-        }
-    }
-
-    private fun stopRecording() {
-        if (connecting) return endSession("اتصال لغو شد")
-        if (!recording) return
-        stopping = true
-        recording = false
-        recordButton.isEnabled = false
-        status.text = "در حال تکمیل آخرین جمله…"
-    }
-
-    private fun finishIfComplete() {
-        if (stopping && micFinished && pending.get() == 0) {
-            endSession("✓ متن آماده است؛ برای کپی روی کادر بزنید")
-        }
-    }
-
-    private fun endSession(message: String) {
-        if (connecting || recording || stopping) renderLive()
-        recording = false
-        connecting = false
-        stopping = false
-        ++generation
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        socket?.close(1000, "finished")
-        socket = null
-        recordButton.text = "🎙  شروع ضبط آنلاین"
-        recordButton.isEnabled = !uploading
-        status.text = message
-        persistText()
-        paragraphs.clear()
-        partials.clear()
-        finalizedIds.clear()
-    }
-
-    private fun apiError(body: String, code: Int): String {
-        val detail = try {
-            JSONObject(body).optJSONObject("error")?.optString("message").orEmpty()
-        } catch (_: Exception) { "" }
-        return "HTTP $code${if (detail.isNotBlank()) " - $detail" else ""}"
-    }
-
-    @Deprecated("Android system document picker")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
+    @Deprecated("انتخاب فایل توسط سیستم اندروید")
+    override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(code, resultCode, data)
         if (resultCode != RESULT_OK) return
-        when (requestCode) {
-            REQUEST_FILE -> data?.data?.let { uploadAudio(it) }
-            REQUEST_EXPORT -> data?.data?.let { uri ->
+        when (code) {
+            PICK_AUDIO -> data?.data?.let { transcribeFile(it) }
+            EXPORT_TEXT -> data?.data?.let { uri ->
                 try {
                     contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
-                        it.write(currentText())
-                    } ?: throw IOException("فایل برای نوشتن باز نشد")
+                        it.write(allText())
+                    }
                     toast("فایل متنی ذخیره شد")
-                } catch (e: Exception) { toast("خطا: ${e.localizedMessage.orEmpty()}") }
+                } catch (_: Exception) { toast("ذخیره فایل متنی ممکن نشد") }
             }
         }
     }
 
-    private fun uploadAudio(uri: Uri) {
-        val key = savedKey() ?: return
-        if (busy()) return
-        uploading = true
-        recordButton.isEnabled = false
+    private fun transcribeFile(uri: Uri) {
+        if (stage != Stage.IDLE || fileBusy) return
+        val secret = key() ?: return toast("کلید OpenAI را ذخیره کنید")
+        fileBusy = true
+        updateControls()
         status.text = "در حال تبدیل فایل صوتی…"
         Thread {
             var temp: File? = null
             try {
-                val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                val cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME),
+                    null, null, null)
+                val name = cursor?.use { if (it.moveToFirst()) it.getString(0) else null }
                     ?: uri.lastPathSegment.orEmpty()
                 val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
-                if (ext !in setOf("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "ogg", "flac")) {
-                    throw IOException("فایل MP3، WAV یا M4A انتخاب کنید")
+                if (ext !in setOf("mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm")) {
+                    throw IOException("فرمت فایل پشتیبانی نمی‌شود")
                 }
-                val file = File.createTempFile("avanegar_", ".$ext", cacheDir)
-                temp = file
+                temp = File.createTempFile("voice_", "." + ext, cacheDir)
+                val destination = temp
                 contentResolver.openInputStream(uri)?.use { source ->
-                    file.outputStream().use { destination ->
-                        val buffer = ByteArray(16_384)
-                        var bytes = 0L
+                    destination.outputStream().use { output ->
+                        val buffer = ByteArray(16384)
+                        var total = 0L
                         while (true) {
                             val n = source.read(buffer)
                             if (n < 0) break
-                            bytes += n
-                            if (bytes > 24L * 1024 * 1024) throw IOException("حجم فایل بیش از ۲۴ مگابایت است")
-                            destination.write(buffer, 0, n)
+                            total += n
+                            if (total > 24L * 1024 * 1024) throw IOException("فایل بیش از ۲۴ مگابایت است")
+                            output.write(buffer, 0, n)
                         }
                     }
                 } ?: throw IOException("فایل باز نشد")
                 val form = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("model", "gpt-transcribe")
                     .addFormDataPart("languages[]", "fa")
-                    .addFormDataPart("prompt", "گفتار فارسی به خط فارسی.")
-                    .addFormDataPart("file", "audio.$ext", file.asRequestBody("application/octet-stream".toMediaType()))
+                    .addFormDataPart("prompt", "گفتار فارسی را با خط فارسی و نشانه‌گذاری مناسب بنویس.")
+                    .addFormDataPart("file", "audio." + ext,
+                        destination.asRequestBody("application/octet-stream".toMediaType()))
                     .build()
-                val request = Request.Builder().url("https://api.openai.com/v1/audio/transcriptions")
-                    .header("Authorization", "Bearer $key")
-                    .post(form).build()
-                http.newBuilder().callTimeout(180, TimeUnit.SECONDS).readTimeout(180, TimeUnit.SECONDS)
-                    .build().newCall(request).execute().use { result ->
-                        val body = result.body?.string().orEmpty()
-                        if (!result.isSuccessful) throw IOException(apiError(body, result.code))
-                        val text = JSONObject(body).optString("text")
-                        if (text.isBlank()) throw IOException("سرویس متن خالی بازگرداند")
-                        ui.post {
-                            val before = currentText()
-                            transcript.text = (if (before.isBlank()) text else "$before\n$text")
-                            transcriptScroll.post { transcriptScroll.fullScroll(View.FOCUS_DOWN) }
-                            persistText()
-                            status.text = "✓ فایل تبدیل شد؛ کادر را لمس کنید تا کپی شود"
-                        }
+                val req = Request.Builder().url("https://api.openai.com/v1/audio/transcriptions")
+                    .header("Authorization", "Bearer " + secret).post(form).build()
+                http.newCall(req).execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("کد " + response.code)
+                    val value = JSONObject(response.body?.string().orEmpty()).optString("text")
+                    if (value.isBlank()) throw IOException("متنی تشخیص داده نشد")
+                    ui.post {
+                        baseText = listOf(allText(), value).filter { it.isNotBlank() }.joinToString("\n")
+                        pieces.clear()
+                        render()
+                        saveDraft()
+                        status.text = "✓ فایل تبدیل شد؛ برای کپی روی کادر بزنید"
                     }
-            } catch (e: Exception) {
-                ui.post { status.text = "خطای تبدیل فایل: ${e.localizedMessage.orEmpty()}" }
+                }
+            } catch (_: Exception) {
+                ui.post { status.text = "تبدیل فایل انجام نشد؛ فرمت، اینترنت و اعتبار را بررسی کنید" }
             } finally {
                 temp?.delete()
-                ui.post { uploading = false; recordButton.isEnabled = true }
+                ui.post { fileBusy = false; updateControls() }
             }
-        }.apply { name = "Avanegar-File-Upload"; start() }
-    }
-
-    private fun saveHistory() {
-        val text = currentText()
-        if (text.isBlank()) return toast("متنی برای ذخیره نیست")
-        val entries = try { JSONArray(prefs.getString(HISTORY_KEY, "[]")) } catch (_: Exception) { JSONArray() }
-        val stamp = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale("fa")).format(Date())
-        val updated = JSONArray().put(JSONObject().put("date", stamp).put("text", text))
-        for (i in 0 until min(49, entries.length())) updated.put(entries.getJSONObject(i))
-        prefs.edit().putString(HISTORY_KEY, updated.toString()).apply()
-        toast("در تاریخچه ذخیره شد ✓")
-    }
-
-    private fun showHistory() {
-        if (busy()) return toast("ابتدا عملیات فعلی را تمام کنید")
-        val entries = try { JSONArray(prefs.getString(HISTORY_KEY, "[]")) } catch (_: Exception) { JSONArray() }
-        if (entries.length() == 0) return toast("تاریخچه خالی است")
-        val names = Array(entries.length()) { i ->
-            entries.getJSONObject(i).let { item ->
-                "${item.optString("date")} · ${item.optString("text").replace('\n', ' ').take(50)}"
-            }
-        }
-        AlertDialog.Builder(this).setTitle("تاریخچه گفتارهای فارسی")
-            .setItems(names) { _, which ->
-                transcript.text = entries.getJSONObject(which).optString("text")
-                persistText()
-                toast("متن بازیابی شد؛ روی کادر بزنید تا کپی شود")
-            }
-            .setNeutralButton("حذف تاریخچه") { _, _ ->
-                AlertDialog.Builder(this).setMessage("تمام متن‌های ذخیره‌شده حذف شوند؟")
-                    .setNegativeButton("انصراف", null)
-                    .setPositiveButton("حذف") { _, _ ->
-                        prefs.edit().remove(HISTORY_KEY).apply()
-                        toast("تاریخچه پاک شد")
-                    }.show()
-            }
-            .setNegativeButton("بستن", null).show()
-    }
-
-    private fun shareText() {
-        val text = currentText()
-        if (text.isBlank()) return toast("متنی برای اشتراک نیست")
-        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, text)
-        }, "اشتراک متن فارسی"))
+        }.apply { name = "Avanegar-File-Transcription"; start() }
     }
 
     override fun onStop() {
         super.onStop()
-        persistText()
-        if (recording || connecting) stopRecording()
+        saveDraft()
+        if (stage == Stage.RECORDING) {
+            stopClock()
+            stage = Stage.PAUSED
+            live?.pause()
+            status.text = "ضبط هنگام خروج از برنامه مکث شد"
+            updateControls()
+        }
     }
 
     override fun onDestroy() {
-        recording = false
-        ++generation
-        socket?.close(1000, "activity destroyed")
-        socket = null
+        saveDraft()
+        live?.cancel()
+        player?.release()
         http.dispatcher.executorService.shutdown()
         super.onDestroy()
     }
