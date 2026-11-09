@@ -88,6 +88,12 @@ class MainActivity : Activity(), LiveSession.Listener {
     private var startedAt = 0L
     private var accumulated = 0L
     private var lastDraftSave = 0L
+    private val clockTicker = object : Runnable {
+        override fun run() {
+            updateClock()
+            ui.postDelayed(this, 400)
+        }
+    }
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -113,12 +119,7 @@ class MainActivity : Activity(), LiveSession.Listener {
 
         render()
         updateControls()
-        ui.post(object : Runnable {
-            override fun run() {
-                updateClock()
-                ui.postDelayed(this, 400)
-            }
-        })
+        ui.post(clockTicker)
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
@@ -184,7 +185,7 @@ class MainActivity : Activity(), LiveSession.Listener {
         for (part in pieces.values) {
             val text = (part.edited ?: part.completed.ifBlank { part.partial }).trim()
             if (text.isNotBlank()) {
-                if (isNotEmpty()) append("\n")
+                if (isNotEmpty()) append(" ")
                 append(text)
             }
         }
@@ -742,10 +743,17 @@ class MainActivity : Activity(), LiveSession.Listener {
             live?.pause()
             status.text = "ضبط هنگام خروج از برنامه مکث شد"
             updateControls()
+        } else if (stage == Stage.CONNECTING) {
+            live?.cancel()
+            live = null
+            stage = Stage.IDLE
+            status.text = "اتصال هنگام خروج از برنامه لغو شد"
+            updateControls()
         }
     }
 
     override fun onDestroy() {
+        ui.removeCallbacks(clockTicker)
         saveDraft()
         live?.cancel()
         player?.release()
