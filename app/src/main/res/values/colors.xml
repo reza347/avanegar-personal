@@ -1,0 +1,8 @@
+<resources>
+    <color name="navy">#0D1022</color>
+    <color name="surface">#18172D</color>
+    <color name="teal">#A173FF</color>
+    <color name="text">#F6FAFF</color>
+    <color name="muted">#ABB2D1</color>
+    <color name="line">#322B53</color>
+</resources>

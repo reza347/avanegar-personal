@@ -1,0 +1,1 @@
+Version 0.3; repo public; minimal one-screen Persian UI; key in Android Keystore; Realtime gpt-live-transcribe; build via GitHub Actions; runtime requires user's API key and device validation.

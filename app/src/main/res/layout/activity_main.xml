@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/navy"
+    android:layoutDirection="ltr"
+    android:paddingLeft="20dp"
+    android:paddingRight="20dp"
+    android:paddingTop="16dp"
+    android:paddingBottom="20dp">
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="56dp">
+
+        <ImageButton
+            android:id="@+id/settingsButton"
+            android:layout_width="50dp"
+            android:layout_height="50dp"
+            android:layout_gravity="start|center_vertical"
+            android:background="@drawable/button_secondary"
+            android:src="@drawable/ic_settings"
+            android:tint="@color/text"
+            android:contentDescription="تنظیمات"
+            android:padding="13dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:fontFamily="sans-serif-medium"
+            android:text="آوانگار"
+            android:textColor="@color/text"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:layout_marginBottom="12dp"
+        android:gravity="center"
+        android:text="برای شروع، دکمه ضبط را بزنید"
+        android:textColor="@color/muted"
+        android:textSize="13sp" />
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:background="@drawable/card">
+
+        <ScrollView
+            android:id="@+id/transcriptScroll"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:fillViewport="true"
+            android:padding="17dp"
+            android:scrollbars="none">
+            <TextView
+                android:id="@+id/transcript"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:minHeight="200dp"
+                android:paddingBottom="25dp"
+                android:clickable="true"
+                android:focusable="true"
+                android:contentDescription="متن گفتار؛ برای کپی تمام متن یک بار لمس کنید"
+                android:text=""
+                android:hint="متن گفتار فارسی اینجا نوشته می‌شود…\n\nبرای کپی تمام متن، یک بار روی این کادر بزنید."
+                android:textDirection="rtl"
+                android:layoutDirection="rtl"
+                android:gravity="top|right"
+                android:textColor="@color/text"
+                android:textColorHint="@color/muted"
+                android:textSize="19sp"
+                android:lineSpacingExtra="7dp" />
+        </ScrollView>
+    </FrameLayout>
+
+    <Button
+        android:id="@+id/recordButton"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginTop="18dp"
+        android:background="@drawable/button_primary"
+        android:text="🎙  شروع ضبط آنلاین"
+        android:textAllCaps="false"
+        android:textColor="@color/navy"
+        android:textSize="18sp"
+        android:textStyle="bold" />
+</LinearLayout>
