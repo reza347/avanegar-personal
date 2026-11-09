@@ -118,6 +118,7 @@ public class MainActivity extends Activity {
   }
   private void showSettings(){
     if(recording){toast("ابتدا ضبط را متوقف کنید.");return;}
+    captureEditor();
     base("تنظیمات","مدیریت اتصال به OpenAI فقط برای استفاده شخصی");
     add(label("کلید OpenAI API",20,WHITE,true),25);
     EditText keyBox=new EditText(this);keyBox.setSingleLine(true);keyBox.setTextColor(WHITE);
@@ -190,6 +191,9 @@ public class MainActivity extends Activity {
     }),10);
     add(label("مدل زنده: gpt-live-transcribe | فایل: gpt-transcribe\nاین برنامه صرفاً فارسی است و برای استفاده شخصی طراحی شده است.",12,MUTED,false),25);
   }
+  private void captureEditor(){
+    if(editor!=null && screen.equals("main") && !recording){done=editor.getText().toString();partial="";}
+  }
   private void saveHistory(){
     if(editor==null)return;
     String txt=editor.getText().toString().trim();
@@ -205,6 +209,7 @@ public class MainActivity extends Activity {
   }
   private void showHistory(){
     if(recording){toast("ابتدا ضبط را متوقف کنید.");return;}
+    captureEditor();
     base("تاریخچه","متن‌ها فقط در حافظه خصوصی این گوشی نگهداری می‌شوند");
     try{
       JSONArray a=new JSONArray(getSharedPreferences("history",MODE_PRIVATE).getString("items","[]"));
@@ -242,6 +247,22 @@ public class MainActivity extends Activity {
       }catch(Exception e){toast("ذخیره فایل انجام نشد.");}
     }
   }
+  private String audioName(Uri uri){
+    String name="";
+    try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){
+      if(c!=null && c.moveToFirst())name=c.getString(0);
+    }catch(Exception ignored){}
+    String ext="";
+    if(name!=null && name.lastIndexOf('.')>=0)ext=name.substring(name.lastIndexOf('.')+1).toLowerCase(java.util.Locale.ROOT);
+    if(!java.util.Arrays.asList("mp3","mp4","mpeg","mpga","m4a","wav","webm").contains(ext)){
+      String mime=getContentResolver().getType(uri);
+      if("audio/mpeg".equals(mime) || "audio/mp3".equals(mime))ext="mp3";
+      else if("audio/wav".equals(mime) || "audio/x-wav".equals(mime))ext="wav";
+      else if("audio/webm".equals(mime))ext="webm";
+      else ext="m4a";
+    }
+    return "audio."+ext;
+  }
   private void transcribeFile(Uri uri){
     long size=-1;
     try(Cursor c=getContentResolver().query(uri,new String[]{OpenableColumns.SIZE},null,null,null)){
@@ -267,7 +288,7 @@ public class MainActivity extends Activity {
     RequestBody body=new MultipartBody.Builder().setType(MultipartBody.FORM)
       .addFormDataPart("model","gpt-transcribe")
       .addFormDataPart("languages[]","fa")
-      .addFormDataPart("file","audio.m4a",stream).build();
+      .addFormDataPart("file",audioName(uri),stream).build();
     Request req=new Request.Builder().url("https://api.openai.com/v1/audio/transcriptions")
       .header("Authorization","Bearer "+apiKey()).post(body).build();
     OkHttpClient upload=http.newBuilder().callTimeout(0,TimeUnit.MILLISECONDS).readTimeout(180,TimeUnit.SECONDS).build();
