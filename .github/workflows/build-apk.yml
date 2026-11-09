@@ -21,12 +21,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # ubuntu-latest already includes the Android SDK and sdkmanager.
-      # setup-android@v3 attempts to install removed package 'tools' and fails.
-      - name: Install Android 35 build platform
+      - name: Install Android 35 SDK packages
+        shell: bash
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
+          if [ -z "$SDKMANAGER" ]; then echo "sdkmanager not found in Android SDK"; exit 1; fi
+          echo "Using $SDKMANAGER"
+          "$SDKMANAGER" --install 'platforms;android-35' 'build-tools;35.0.0'
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
