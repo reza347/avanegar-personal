@@ -51,7 +51,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * آوانگار، نسخه ۰.۳ - یک کادر متن + یک دکمه ضبط.
+ * آوانگار، نسخه ۰.۳.۱ - یک کادر متن + یک دکمه ضبط.
  * The user's API key is kept only in Android Keystore-encrypted local storage.
  * Realtime transcription uses the API's transcription session (no server VAD).
  */
@@ -354,7 +354,6 @@ class MainActivity : Activity() {
         val request = Request.Builder()
             .url("wss://api.openai.com/v1/realtime?intent=transcription")
             .header("Authorization", "Bearer $key")
-            .header("OpenAI-Beta", "realtime=v1")
             .build()
         socket = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
