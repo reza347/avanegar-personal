@@ -14,7 +14,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /** اصلاح املا در درخواست غیرهم‌زمان؛ هیچ‌وقت مسیر ضبط و نمایش دلتاها را متوقف نمی‌کند. */
-class PersianEditor(private val apiKey: String) {
+class PersianEditor(private val apiKey: String, private val customVocabulary: String = "") {
     private val ui = Handler(Looper.getMainLooper())
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
@@ -40,9 +40,13 @@ class PersianEditor(private val apiKey: String) {
             .put("reasoning", JSONObject().put("effort", "none"))
             .put("max_output_tokens", 700)
             .put("instructions",
-                "فقط متن داده‌شده را از نظر املای فارسی، نیم‌فاصله، نقطه‌گذاری و جدانویسی اصلاح کن. " +
-                "کلمه جدید اضافه نکن و چیزی را حذف نکن. لحن محاوره‌ای، اعداد، اسامی خاص و معنای گفته‌شده باید حفظ شوند. " +
-                "هیچ مقدمه، توضیح، عنوان یا گیومه‌ای ننویس. خروجی فقط متن اصلاح‌شده باشد.")
+                "متن حاصل از تشخیص گفتار فارسی است. فقط املا، نیم‌فاصله و نشانه‌گذاری را اصلاح کن. " +
+                "اگر واژه‌ای ظاهراً غلط شنیده شده و یک نام خاص در فهرست راهنما از نظر آوایی بسیار نزدیک است، " +
+                "فقط در صورت اطمینان بالا همان نام را جایگزین کن. در غیر این صورت متن اصلی را حفظ کن. " +
+                "هیچ اطلاعات یا کلمه‌ای اضافه نکن و عبارت‌های نامرتبط را به نام‌های فهرست تغییر نده. " +
+                "نام‌های راهنما، الزام برای نوشتن آنها نیستند. لحن گفتاری و معنا را حفظ کن. " +
+                "خروجی فقط متن اصلاح‌شده باشد. " +
+                "فهرست نام‌های احتمالی: " + customVocabulary.take(600))
             .put("input", original)
         val req = Request.Builder()
             .url("https://api.openai.com/v1/responses")
