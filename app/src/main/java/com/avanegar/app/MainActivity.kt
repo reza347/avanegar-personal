@@ -590,6 +590,42 @@ class MainActivity : Activity(), LiveSession.Listener {
             textSize = 12f
             setPadding(0, 0, 0, dp(12))
         })
+        container.addView(TextView(this).apply {
+            text = "نام‌های خاص و نشانی‌های پرتکرار"
+            textSize = 17f
+            setPadding(0, dp(10), 0, dp(3))
+        })
+        val specialWords = EditText(this).apply {
+            setText(prefs.getString("vocabulary", "حاجی‌آباد\nبلوار بهشتی"))
+            hint = "هر اسم خاص را در یک خط بنویسید"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            setSingleLine(false)
+            minLines = 2
+            maxLines = 5
+            textDirection = View.TEXT_DIRECTION_RTL
+            gravity = Gravity.RIGHT or Gravity.TOP
+        }
+        container.addView(specialWords)
+        container.addView(TextView(this).apply {
+            text = "این واژه‌ها صرفاً برای تشخیص بهتر نام‌ها هستند؛ تضمینی برای تشخیص همه واژه‌ها نیستند."
+            textSize = 12f
+            setPadding(0, 0, 0, dp(5))
+        })
+        button("ذخیره نام‌های خاص") {
+            val terms = specialWords.text.toString().lines().map { it.trim() }
+                .filter { it.isNotBlank() }.distinct().take(20)
+            prefs.edit().putString("vocabulary", terms.joinToString("\n")).apply()
+            toast("نام‌ها ذخیره شدند؛ در ضبط بعدی استفاده می‌شوند")
+        }
+        container.addView(Switch(this).apply {
+            text = "دقت بالاتر (تأخیر بیشتر در نمایش)"
+            isChecked = prefs.getBoolean("accurate_mode", false)
+            textSize = 14f
+            setPadding(0, dp(5), 0, dp(10))
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean("accurate_mode", checked).apply()
+            }
+        })
         lateinit var dialog: AlertDialog
         button("تبدیل فایل صوتی به متن") {
             if (stage != Stage.IDLE || fileBusy) return@button toast("ابتدا ضبط را تمام کنید")
