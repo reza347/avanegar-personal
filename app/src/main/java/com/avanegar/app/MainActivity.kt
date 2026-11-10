@@ -281,7 +281,7 @@ class MainActivity : Activity(), LiveSession.Listener {
         correctionsPending = 0
         waitingSave = false
         liveFinished = false
-        editor = PersianEditor(secret)
+        editor = PersianEditor(secret, prefs.getString("vocabulary", "حاجی‌آباد\nبلوار بهشتی").orEmpty())
         stage = Stage.CONNECTING
         status.text = "در حال اتصال به رونویسی زنده…"
         render()
