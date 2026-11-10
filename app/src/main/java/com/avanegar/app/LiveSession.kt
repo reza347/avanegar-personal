@@ -48,6 +48,7 @@ class LiveSession(
         private const val COMMIT_MS = 4000
     }
     private val ui = Handler(Looper.getMainLooper())
+    private val transcriptionPrefs = context.getSharedPreferences("avanegar_prefs_v4", Context.MODE_PRIVATE)
     private val http = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.SECONDS)
@@ -74,11 +75,24 @@ class LiveSession(
             .build()
         ws = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                // Hint uncommon proper nouns. Keywords only guide recognition, never force output.
+                val keywordList = JSONArray()
+                val dictionary = transcriptionPrefs.getString(
+                    "vocabulary", "حاجی‌آباد\nبلوار بهشتی"
+                ).orEmpty().lines()
+                    .map { it.trim().replace(Regex("[<>\\r\\n]"), "") }
+                    .filter { it.isNotBlank() && it.length <= 80 }
+                    .distinct()
+                    .take(20)
+                dictionary.forEach { keywordList.put(it) }
+                val accurateMode = transcriptionPrefs.getBoolean("accurate_mode", false)
                 val transcription = JSONObject()
                     .put("model", "gpt-live-transcribe")
                     .put("languages", JSONArray().put("fa"))
-                    .put("delay", "minimal")
-                    .put("prompt", "گفتار فارسی را دقیق با خط فارسی، نیم‌فاصله‌های مناسب و علائم نگارشی بنویس. اسم اشخاص و مکان‌ها را بدون افزودن کلمه حفظ کن.")
+                    .put("delay", if (accurateMode) "medium" else "low")
+                    .put("prompt", "متن مکالمه محاوره‌ای فارسی است و ممکن است شامل نشانی، نام خیابان، محله، روستا و شهر باشد. " +
+                        "واژه‌های خاص را از روی صدا به فارسی بنویس و کلمه‌ای حدس نزن. در متن نهایی املای فارسی و نشانه‌گذاری را رعایت کن.")
+                    .put("keywords", keywordList)
                 val input = JSONObject()
                     .put("format", JSONObject().put("type", "audio/pcm").put("rate", RATE))
                     .put("transcription", transcription)
